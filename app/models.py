@@ -96,4 +96,16 @@ class RebuildOut(BaseModel):
     success: bool
     rebuilt_devices: list[str]
     failed_devices: dict[str, str]
+    pending_devices: list[str] = Field(
+        default_factory=list,
+        description="本次运行后仍待重建的设备（失败或未覆盖的设备）",
+    )
     detail: str | None = None
+
+
+class PendingRebuildOut(BaseModel):
+    device_id: str
+    reason: str
+    marked_at: str
+    updated_at: str
+    last_error: str | None = None

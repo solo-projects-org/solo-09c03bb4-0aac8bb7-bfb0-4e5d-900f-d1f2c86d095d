@@ -14,7 +14,9 @@ from fastapi.responses import JSONResponse
 from .config import Settings
 from .database import ConnectionPool
 from .errors import ConflictError, RebuildFailure
-from .models import AcceptOut, HandoverIn, IntervalOut, ReadingIn, RebuildOut
+from .models import (
+    AcceptOut, HandoverIn, IntervalOut, PendingRebuildOut, ReadingIn, RebuildOut,
+)
 from . import service
 
 
@@ -52,7 +54,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def health(conn: sqlite3.Connection = Depends(db)):
         row = conn.execute("SELECT COUNT(*) AS n FROM intervals WHERE status='current'").fetchone()
         stale = conn.execute("SELECT COUNT(*) AS n FROM intervals WHERE status='stale'").fetchone()
-        return {"status": "ok", "current_intervals": row["n"], "stale_intervals": stale["n"]}
+        pending = conn.execute("SELECT COUNT(*) AS n FROM pending_rebuilds").fetchone()
+        return {
+            "status": "ok",
+            "current_intervals": row["n"],
+            "stale_intervals": stale["n"],
+            "pending_rebuild_devices": pending["n"],
+        }
 
     @app.post("/readings", response_model=AcceptOut, status_code=201, tags=["读数"])
     def post_reading(
@@ -102,7 +110,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if device_id:
                 fail_set.add(device_id)
             else:
-                fail_set.update(service.devices_with_stale_intervals(conn))
+                fail_set.update(service.devices_needing_rebuild(conn))
         try:
             return service.rebuild(
                 conn, device_id=device_id, all_devices=all_devices,
@@ -112,6 +120,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         except RebuildFailure as exc:  # pragma: no cover - rebuild() records per-device failures
             return JSONResponse(status_code=500, content={"detail": str(exc)})
+
+    @app.get(
+        "/pending-rebuilds",
+        response_model=list[PendingRebuildOut],
+        tags=["区间重建"],
+    )
+    def get_pending_rebuilds(conn: sqlite3.Connection = Depends(db)):
+        """设备待重建查询（持久化，重启后仍可查到失败的设备）。"""
+        return service.pending_rebuild_devices(conn)
 
     @app.get("/intervals", response_model=list[IntervalOut], tags=["区间查询"])
     def get_intervals(

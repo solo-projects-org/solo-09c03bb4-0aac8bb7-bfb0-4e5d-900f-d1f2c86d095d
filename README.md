@@ -65,15 +65,30 @@ docker compose up --build
 ## 迟到数据与重建的一致性保证
 
 1. 读数/交接一旦**受理**，受影响设备的全部 `current` 区间在同一事务内立即
-   置为 `stale`（失去当前供数资格，仍可按 `status=stale` 审计查询）。
+   置为 `stale`（失去当前供数资格，仍可按 `status=stale` 审计查询），并在
+   `pending_rebuilds` 中**持久标记该设备待重建**。即使设备此前没有任何区间
+   （例如新设备刚补齐的第一、二条读数），标记同样写入，不会因“没有旧区间”
+   而被遗忘。
 2. 受理后自动按设备重建；也可 `POST /rebuild?device_id=...` 手动重试，
-   或 `POST /rebuild`（默认只重建仍有 stale 区间的设备）。
-3. 重建在单事务内完成：失败/进程崩溃时事务回滚，旧结果保持 stale，
-   **不会复活为 current**；服务重启不自动重建，只把崩溃遗留的 running
+   或 `POST /rebuild`（默认重建“待重建标记 ∪ 仍有 stale 区间”的全部设备，
+   因此失败后和重启后都能被默认重试覆盖）。
+3. 重建在单事务内完成：**新 current 区间写入与待重建标记删除一起提交**。
+   失败/进程崩溃时事务回滚：旧结果保持 stale，**不会复活为 current**，待重建
+   标记保留并记录 `last_error`；服务重启不自动重建，只把崩溃遗留的 running
    运行标记为 `interrupted`（见 `GET /rebuild-runs`）。
 4. 重建按设备隔离：一个设备失败不影响其他设备，无关区间全程可查；
-   重试可完成重建并恢复 current 供数。
-5. 无法判定的区间以 `null` 表达，零值只表示实测零差值。
+   重试可完成重建并恢复 current 供数。每次重建先删除该设备的 current 行再
+   插入，重复重试不会产生重复现行区间。
+5. 成功的重建即使只算出 0 个区间（设备只有一条读数），也会退出待重建。
+6. 无法判定的区间以 `null` 表达，零值只表示实测零差值。
+
+### 待重建查询 `GET /pending-rebuilds`
+
+返回 `device_id / reason / marked_at / updated_at / last_error` 列表；
+进程重启后仍可查到尚未成功重建的设备。`/health` 同时给出
+`pending_rebuild_devices` 计数。`POST /rebuild` 的响应包含 `success`
+（仅当本次尝试的设备全部提交成功才为真）与 `pending_devices`（运行后仍待
+重建的设备）。
 
 测试钩子：对提交或 `/rebuild` 加请求头 `X-Fail-Rebuild: true`，
 对应设备的重建会在提交前失败，用于验证上述失败/重试场景。
@@ -90,7 +105,7 @@ pytest -q
 
 ```
 app/            FastAPI 应用（models/database/service/main）
-tests/          17 项端到端自测（TestClient + 临时 SQLite 文件）
+tests/          23 项端到端自测（TestClient + 临时 SQLite 文件）
 Dockerfile      python:3.11-slim 镜像，含 /health 健康检查
 docker-compose.yml
 ```

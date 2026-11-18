@@ -369,4 +369,157 @@ def test_health_and_openapi(ctx):
     assert client.get("/health").json()["status"] == "ok"
     spec = client.get("/openapi.json").json()
     assert "/readings" in spec["paths"] and "/handovers" in spec["paths"]
+    assert "/pending-rebuilds" in spec["paths"]
     assert client.get("/docs").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 6. Pending rebuild marker: first readings with no prior intervals
+# ---------------------------------------------------------------------------
+
+def pending_devices(client):
+    return [row["device_id"] for row in client.get("/pending-rebuilds").json()]
+
+
+def test_first_two_readings_failed_rebuild_persists_pending(ctx):
+    """Regression: a brand-new device has no old intervals to mark stale.
+
+    Accepting its second reading must still durably record it as pending so a
+    default retry rebuilds it instead of silently reporting success.
+    """
+    client, _, _ = ctx
+    assert client.post(
+        "/readings",
+        json=reading("R1", 1, "DEV-A", "2026-11-10T00:00:00Z", "M-100", 1000.0),
+    ).status_code == 201
+
+    r = client.post(
+        "/readings",
+        headers={"X-Fail-Rebuild": "true"},
+        json=reading("R2", 1, "DEV-A", "2026-11-10T01:00:00Z", "M-100", 1010.0),
+    )
+    body = r.json()
+    assert body["accepted"] is True
+    assert body["rebuild"]["success"] is False
+    # Device has no intervals at all yet, but is still discoverable as pending.
+    assert current_intervals(client, "DEV-A") == []
+    assert all_intervals(client, "DEV-A") == []
+    assert pending_devices(client) == ["DEV-A"]
+    assert client.get("/pending-rebuilds").json()[0]["last_error"]
+
+    # The default retry picks up the pending device (not just stale rows).
+    r = client.post("/rebuild")
+    assert r.status_code == 200 and r.json()["success"] is True
+    assert r.json()["pending_devices"] == []
+    assert pending_devices(client) == []
+    iv = current_intervals(client, "DEV-A")
+    assert len(iv) == 1 and iv[0]["energy_kwh"] == pytest.approx(10.0)
+
+    # Repeated retries must not duplicate the current interval.
+    client.post("/rebuild")
+    client.post("/rebuild", params={"all_devices": True})
+    client.post("/rebuild", params={"device_id": "DEV-A"})
+    assert len(current_intervals(client, "DEV-A")) == 1
+
+
+def test_pending_survives_restart_and_default_rebuild_recovers(ctx):
+    client, db_path, _ = ctx
+    client.post(
+        "/readings",
+        json=reading("R1", 1, "DEV-A", "2026-11-10T00:00:00Z", "M-100", 1000.0),
+    )
+    client.post(
+        "/readings",
+        headers={"X-Fail-Rebuild": "true"},
+        json=reading("R2", 1, "DEV-A", "2026-11-10T01:00:00Z", "M-100", 1010.0),
+    )
+    assert pending_devices(client) == ["DEV-A"]
+
+    app2 = create_app(Settings(db_path=db_path, fail_device=None))
+    with TestClient(app2) as client2:
+        # Boot does not rebuild, but the pending marker persists.
+        assert current_intervals(client2, "DEV-A") == []
+        rows = client2.get("/pending-rebuilds").json()
+        assert [r["device_id"] for r in rows] == ["DEV-A"]
+
+        # A plain POST /rebuild now actually handles the device.
+        r = client2.post("/rebuild")
+        assert r.json()["success"] is True
+        assert "DEV-A" in " ".join(r.json()["rebuilt_devices"])
+        assert client2.get("/pending-rebuilds").json() == []
+        iv = current_intervals(client2, "DEV-A")
+        assert len(iv) == 1 and iv[0]["energy_kwh"] == pytest.approx(10.0)
+
+
+def test_single_reading_device_exits_pending_after_success(ctx):
+    """First reading's auto-rebuild succeeds with zero intervals: not pending."""
+    client, _, _ = ctx
+    r = client.post(
+        "/readings",
+        json=reading("R1", 1, "DEV-A", "2026-11-10T00:00:00Z", "M-100", 1000.0),
+    )
+    assert r.json()["rebuild"]["success"] is True
+    assert pending_devices(client) == []
+    assert current_intervals(client, "DEV-A") == []
+
+
+def test_handover_without_old_intervals_persists_pending(ctx):
+    client, _, _ = ctx
+    r = client.post(
+        "/handovers",
+        headers={"X-Fail-Rebuild": "true"},
+        json=handover("HV1", 1, "DEV-A", "2026-11-10T00:00:00Z", "M-100", 0.0, "M-200", 0.0),
+    )
+    assert r.status_code == 201
+    assert r.json()["rebuild"]["success"] is False
+    assert pending_devices(client) == ["DEV-A"]
+    assert client.post("/rebuild").json()["success"] is True
+    assert pending_devices(client) == []
+
+
+def test_failed_retry_stays_pending_and_not_reported_success(ctx):
+    client, _, _ = ctx
+    client.post(
+        "/readings",
+        json=reading("R1", 1, "DEV-A", "2026-11-10T00:00:00Z", "M-100", 1000.0),
+    )
+    client.post(
+        "/readings",
+        headers={"X-Fail-Rebuild": "true"},
+        json=reading("R2", 1, "DEV-A", "2026-11-10T01:00:00Z", "M-100", 1010.0),
+    )
+    # Default retry fails again: response must say so and keep the marker.
+    r = client.post("/rebuild", headers={"X-Fail-Rebuild": "true"})
+    body = r.json()
+    assert body["success"] is False and "DEV-A" in body["failed_devices"]
+    assert body["pending_devices"] == ["DEV-A"]
+    assert current_intervals(client, "DEV-A") == []
+    assert pending_devices(client) == ["DEV-A"]
+
+
+def test_pending_retry_does_not_disturb_unrelated_device(ctx):
+    client, _, _ = ctx
+    client.post(
+        "/readings",
+        json=reading("K1", 1, "DEV-B", "2026-11-10T00:00:00Z", "N-1", 200.0),
+    )
+    client.post(
+        "/readings",
+        json=reading("K2", 1, "DEV-B", "2026-11-10T02:00:00Z", "N-1", 225.0),
+    )
+    client.post(
+        "/readings",
+        json=reading("R1", 1, "DEV-A", "2026-11-10T00:00:00Z", "M-100", 1000.0),
+    )
+    client.post(
+        "/readings",
+        headers={"X-Fail-Rebuild": "true"},
+        json=reading("R2", 1, "DEV-A", "2026-11-10T01:00:00Z", "M-100", 1010.0),
+    )
+    before = current_intervals(client, "DEV-B")
+    assert len(before) == 1 and before[0]["energy_kwh"] == pytest.approx(25.0)
+    assert client.post("/rebuild").json()["success"] is True
+    after = current_intervals(client, "DEV-B")
+    assert len(after) == 1 and after[0]["energy_kwh"] == pytest.approx(25.0)
+    assert pending_devices(client) == []
+

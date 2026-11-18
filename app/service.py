@@ -7,10 +7,14 @@ Key guarantees implemented here:
   posting different content under an existing (source_id, revision) is
   rejected with 409.
 * As soon as a late reading/correction is *accepted*, every current interval
-  of every affected device is marked ``stale`` inside the same transaction.
+  of every affected device is marked ``stale`` inside the same transaction and
+  the device is durably recorded in ``pending_rebuilds`` — even when it has no
+  old intervals (e.g. the first two readings of a new device).
 * The rebuild that follows runs in its own transaction per device.  A failure
-  (or a process kill, or a restart) leaves the stale rows in place — old
-  results never come back as current, and devices not involved keep serving.
+  (or a process kill, or a restart) leaves the stale rows and the pending
+  marker in place — old results never come back as current, the device stays
+  discoverable via ``GET /pending-rebuilds``, and devices not involved keep
+  serving.  Only a committed successful rebuild clears the pending marker.
 * Undeterminable intervals are stored with ``energy_kwh = NULL``; zero is
   only ever written for a genuinely measured zero difference.
 """
@@ -96,6 +100,65 @@ def _stale_current_intervals(conn: sqlite3.Connection, device_ids: list[str]) ->
     return cur.rowcount
 
 
+def _mark_pending(conn: sqlite3.Connection, device_ids: list[str], reason: str) -> None:
+    """Durably record that these devices owe a successful rebuild.
+
+    Written inside the same transaction that accepts the submission, so an
+    affected device is never forgotten just because it had no old intervals
+    to mark stale.
+    """
+    now = utc_now_iso()
+    for device_id in device_ids:
+        conn.execute(
+            "INSERT INTO pending_rebuilds (device_id, reason, marked_at, updated_at) "
+            "VALUES (?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET "
+            "reason = excluded.reason, updated_at = excluded.updated_at, "
+            "last_error = NULL",
+            (device_id, reason, now, now),
+        )
+
+
+def pending_rebuild_devices(conn: sqlite3.Connection) -> list[dict]:
+    return [
+        dict(r)
+        for r in conn.execute(
+            "SELECT device_id, reason, marked_at, updated_at, last_error "
+            "FROM pending_rebuilds ORDER BY device_id"
+        ).fetchall()
+    ]
+
+
+def _clear_pending(conn: sqlite3.Connection, device_id: str) -> None:
+    conn.execute("DELETE FROM pending_rebuilds WHERE device_id = ?", (device_id,))
+
+
+def _record_pending_failure(conn: sqlite3.Connection, device_id: str, error: str) -> None:
+    """Keep (or create) the pending marker after a failed rebuild."""
+    now = utc_now_iso()
+    conn.execute(
+        "INSERT INTO pending_rebuilds (device_id, reason, marked_at, updated_at, last_error) "
+        "VALUES (?,?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET "
+        "updated_at = excluded.updated_at, last_error = excluded.last_error",
+        (device_id, "rebuild failed", now, now, error[:1000]),
+    )
+
+
+def devices_pending_rebuild(conn: sqlite3.Connection) -> list[str]:
+    return [
+        r["device_id"]
+        for r in conn.execute(
+            "SELECT device_id FROM pending_rebuilds ORDER BY device_id"
+        )
+    ]
+
+
+def devices_needing_rebuild(conn: sqlite3.Connection) -> list[str]:
+    """Every device that must be rebuilt: durably pending or holding stale rows."""
+    return sorted(
+        set(devices_pending_rebuild(conn)) | set(devices_with_stale_intervals(conn))
+    )
+
+
 def submit_reading(conn: sqlite3.Connection, payload: ReadingIn) -> dict:
     ts_iso = to_utc_iso(payload.ts)
     content = {
@@ -132,6 +195,10 @@ def submit_reading(conn: sqlite3.Connection, payload: ReadingIn) -> dict:
                 devices.add(prev["device_id"])
             affected = sorted(devices)
             _stale_current_intervals(conn, affected)
+            _mark_pending(
+                conn, affected,
+                f"reading {payload.source_id} revision {payload.revision} accepted",
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -183,6 +250,10 @@ def submit_handover(conn: sqlite3.Connection, payload: HandoverIn) -> dict:
                 devices.add(prev["device_id"])
             affected = sorted(devices)
             _stale_current_intervals(conn, affected)
+            _mark_pending(
+                conn, affected,
+                f"handover {payload.source_id} revision {payload.revision} accepted",
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -314,10 +385,11 @@ def rebuild_device(
 
     Previously stale rows are kept for audit; only ``current`` rows are
     replaced, and new rows are inserted as ``current`` in one transaction.
-    An injected failure raises *before* commit to simulate a crash: rollback
-    leaves the run at status ``running`` and every previously stale interval
-    untouched.  On service restart init_db flips dangling ``running`` runs to
-    ``interrupted`` without reviving any interval.
+    Failed rebuilds leave the pending marker in place (creating one when an
+    explicit rebuild fails), so the device remains discoverable after a crash
+    or restart.  A committed success replaces the current rows and clears the
+    pending marker in the same transaction — even when the device now has only
+    one reading and therefore zero intervals.
     """
     fail_header_devices = fail_header_devices or set()
     run = conn.execute(
@@ -346,6 +418,8 @@ def rebuild_device(
         ]
 
         # Stale rows stay as an audit trail; only current rows are replaced.
+        # Deleting before inserting keeps repeated rebuilds free of duplicate
+        # current intervals.
         conn.execute(
             "DELETE FROM intervals WHERE device_id = ? AND status = 'current'",
             (device_id,),
@@ -364,6 +438,10 @@ def rebuild_device(
                     r["handover_source_id"], r["handover_revision"],
                 ),
             )
+        # The new current rows and the clearing of the pending marker commit
+        # together: there is no window where the device serves current data
+        # but still looks pending, or the other way round.
+        _clear_pending(conn, device_id)
         conn.execute(
             "UPDATE rebuild_runs SET status = 'success', "
             "finished_at = ? WHERE id = ?",
@@ -373,11 +451,15 @@ def rebuild_device(
         return len(rows)
     except RebuildFailure:
         # Simulated crash: rollback and deliberately leave the run 'running'
-        # so the restart path marks it 'interrupted'.  Stale rows survive.
+        # so the restart path marks it 'interrupted'.  Stale rows and the
+        # pending marker survive, so a later retry still finds the device.
         conn.rollback()
+        _record_pending_failure(conn, device_id, "injected rebuild failure")
+        conn.commit()
         raise
     except Exception as exc:
         conn.rollback()
+        _record_pending_failure(conn, device_id, str(exc))
         conn.execute(
             "UPDATE rebuild_runs SET status = 'failed', detail = ?, "
             "finished_at = ? WHERE id = ?",
@@ -402,24 +484,33 @@ def rebuild(
     ``devices`` limits the run to an explicit set (used by automatic rebuilds
     after submissions, including a device's very first reading when no stale
     rows exist yet).  By default all devices that have readings are rebuilt;
-    ``only_stale=True`` limits the run to devices currently holding stale
-    intervals.  A failure on one device is recorded and does not abort the
-    others; stale intervals of a failed device remain queryable as stale and
-    never regain current eligibility.
+    ``only_stale=True`` limits the run to devices that owe a rebuild, i.e. the
+    union of durably pending devices and devices currently holding stale
+    intervals.  That union is what makes a plain ``POST /rebuild`` retry a
+    device whose first rebuild failed before it ever had an interval.
+
+    A failure on one device is recorded and does not abort the others; stale
+    intervals and the pending marker of a failed device remain queryable and
+    never regain current eligibility.  ``success`` is only true when every
+    attempted device committed, so a skipped or failed device is never
+    reported as a successful recovery.
     """
     if device_id is not None:
         targets = [device_id]
     elif devices is not None:
         targets = list(dict.fromkeys(devices))  # de-duplicate, keep order
     elif all_devices or not only_stale:
-        targets = [
-            r["device_id"]
-            for r in conn.execute(
-                "SELECT DISTINCT device_id FROM readings ORDER BY 1"
-            )
-        ]
+        targets = sorted(
+            {
+                r["device_id"]
+                for r in conn.execute(
+                    "SELECT DISTINCT device_id FROM readings ORDER BY 1"
+                )
+            }
+            | set(devices_needing_rebuild(conn))
+        )
     else:
-        targets = devices_with_stale_intervals(conn)
+        targets = devices_needing_rebuild(conn)
 
     rebuilt: list[str] = []
     failed: dict[str, str] = {}
@@ -435,13 +526,15 @@ def rebuild(
             failed[dev] = exc.reason
 
     success = not failed
+    remaining = devices_pending_rebuild(conn)
     run_row = conn.execute(
         "INSERT INTO rebuild_runs (device_id, status, detail, finished_at) "
         "VALUES (?,?,?,?)",
         (
             device_id,
             "success" if success else "failed",
-            json.dumps({"rebuilt": rebuilt, "failed": failed}),
+            json.dumps({"rebuilt": rebuilt, "failed": failed,
+                        "pending_after_run": remaining}),
             utc_now_iso(),
         ),
     )
@@ -451,6 +544,7 @@ def rebuild(
         "success": success,
         "rebuilt_devices": rebuilt,
         "failed_devices": failed,
+        "pending_devices": remaining,
     }
 
 
